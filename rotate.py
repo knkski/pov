@@ -5,17 +5,56 @@
 
 """
 
-import RPi.GPIO as GPIO
-import time
-import math
-from contextlib import contextmanager
 import argparse
-from functools import partial
-import board
+import time
+from contextlib import contextmanager
+
+import RPi.GPIO as GPIO
 import adafruit_dotstar as dotstar
-from random import randint
+import board
 
 DOTS = 72
+
+freqs = (
+    100,
+    150,
+    200,
+    400,
+    600,
+    800,
+    1000,
+    1200,
+    1400,
+    1600,
+    2000,
+    2500,
+    3000,
+    3500,
+    4000,
+    4250,
+) + tuple(range(4300, 30000, 75))
+
+
+COLORS = {
+    'rainbow': (
+        (209, 0, 0),
+        (255, 102, 34),
+        (255, 218, 33),
+        (51, 221, 0),
+        (17, 51, 204),
+        (34, 0, 102),
+        (51, 0, 68),
+    ),
+    'america': (
+        (255, 0, 0),
+        (255, 255, 255),
+        (0, 0, 255),
+    ),
+    'bruised': (
+        (0, 0, 115),
+        (0, 0, 0),
+    )
+}
 
 
 @contextmanager
@@ -29,7 +68,7 @@ def PWM(pin):
         # GPIO.setmode(GPIO.BOARD)
         GPIO.setup(pin, GPIO.OUT)
         pwm = GPIO.PWM(pin, 1)
-        pwm.start(50)
+        pwm.start(30)
         yield pwm
     finally:
         try:
@@ -39,49 +78,35 @@ def PWM(pin):
         GPIO.cleanup()
 
 
-def freq(max_freq, growth, dt):
-    """Calculate spin-up frequency according to S-curve based on time."""
-    # return max(max_freq, 0.1 * math.pow(now - start, 2))
-    return max_freq / (1 + max_freq / 5 * math.pow(math.e, -growth * dt))
-
-
 def main():
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(18, GPIO.OUT)
-    # for i in range(3200):
-    timeout = 0.005
-    with dotstar.DotStar(board.SCK, board.MOSI, DOTS, brightness=1.0, auto_write=False) as dots:
-        dots[0] = (255, 0, 0)
-        dots.show()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--colors', choices=list(COLORS.keys()), default='rainbow')
+    args = parser.parse_args()
+
+    colors = COLORS[args.colors]
+
+    start = time.time()
+
+    with PWM(pin=12) as pwm, dotstar.DotStar(board.SCK, board.MOSI, DOTS, brightness=1.0, auto_write=False) as dots:
+        old_step = 0
+        color_idx = 0
+
         while True:
-            timeout = max(0.00025, 0.999 * timeout)
-            GPIO.output(18, 1)
-            time.sleep(timeout)
-            GPIO.output(18, 0)
-            time.sleep(timeout)
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument('-m', '--max-frequency', type=int, default=1000)
-    # parser.add_argument('-g', '--growth', type=float, default=2.0)
-    # args = parser.parse_args()
-    #
-    # start = time.time()
-    #
-    # f = partial(freq, max_freq=args.max_frequency, growth=args.growth)
-    #
-    # with PWM(pin=18) as pwm, dotstar.DotStar(board.SCK, board.MOSI, DOTS, brightness=1.0, auto_write=False) as dots:
-    #     dots[0] = (255, 0, 0)
-    #     dots.show()
-    #     while True:
-    #         time.sleep(0.1)
-    #         dt = time.time() - start
-    #         frequency = f(dt=dt)
-    #         pwm.ChangeFrequency(frequency)
-    #
-    #         # if dt % 0.1 < 0.005:
-    #         #     dots[0] = (255, 0, 0)
-    #         # else:
-    #         #     dots[0] = (0, 0, 0)
-    #         # dots.show()
+            time.sleep(0.01)
+            dt = time.time() - start
+            steps = int(dt * 4)
+
+            for doti in range(len(dots)):
+                dots[doti] = colors[color_idx]
+            dots.show()
+
+            if old_step != steps:
+                old_step = steps
+                freq_idx = min(len(freqs) - 1, steps)
+                freq = freqs[freq_idx]
+                pwm.ChangeFrequency(freq)
+
+            color_idx = (color_idx + 1) % len(colors)
 
 
 if __name__ == '__main__':
