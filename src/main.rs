@@ -1,19 +1,64 @@
 //! Controls an apa102 LED strip
 
 #![deny(unsafe_code)]
-//#![deny(warnings)]
+#![deny(warnings)]
 #![no_std]
 #![no_main]
 
 extern crate panic_semihosting;
 
 use cortex_m_rt::entry;
-use embedded_hal::spi::MODE_3;
-use f3::hal::{delay::Delay, prelude::*, spi::Spi, stm32f30x, i2c::I2c};
-use f3::Lsm303dlhc;
-use cortex_m_semihosting::hprintln;
+use f3::hal::{delay::Delay, prelude::*, spi::Spi, stm32f30x, gpio::gpioa::{PA5, PA6, PA7}, gpio::AF5};
+use smart_leds::RGB8;
+use ws2812_spi as ws2812;
+use nb::block;
 
-const NUM_LEDS: i32 = 142;
+fn wheel(pos: u8, brightness: u8) -> RGB8 {
+    match pos {
+        0..=84 => RGB8 {
+            r: (255 - 3 * pos) / brightness,
+            g: 3 * pos / brightness,
+            b: 0,
+        },
+        85..=170 => RGB8 {
+            r: 0,
+            g: (255 - 3 * (pos - 85)) / brightness,
+            b: 3 * (pos - 85) / brightness,
+        },
+        170..=255 => RGB8 {
+            r: 3 * (pos - 170) / brightness,
+            g: 0,
+            b: (255 - 3 * (pos - 170)) / brightness,
+        }
+    }
+}
+
+// Write a single byte for ws2812 devices
+fn write_byte(spi: &mut Spi<stm32f30x::SPI1, (PA5<AF5>, PA6<AF5>, PA7<AF5>)>, mut data: u8) {
+    let mut serial_bits: u32 = 0;
+    for _ in 0..3 {
+        let bit = data & 0x80;
+        let pattern = if bit == 0x80 { 0b110 } else { 0b100 };
+        serial_bits = pattern | (serial_bits << 3);
+        data <<= 1;
+    }
+    block!(spi.send((serial_bits >> 1) as u8)).unwrap();
+    // Split this up to have a bit more lenient timing
+    for _ in 3..8 {
+        let bit = data & 0x80;
+        let pattern = if bit == 0x80 { 0b110 } else { 0b100 };
+        serial_bits = pattern | (serial_bits << 3);
+        data <<= 1;
+    }
+    // Some implementations (stm32f0xx-hal) want a matching read
+    // We don't want to block so we just hope it's ok this way
+    spi.read().ok();
+    block!(spi.send((serial_bits >> 8) as u8)).unwrap();
+    spi.read().ok();
+    block!(spi.send(serial_bits as u8)).unwrap();
+    spi.read().ok();
+}
+
 
 #[entry]
 fn main() -> ! {
@@ -22,12 +67,23 @@ fn main() -> ! {
 
     let mut flash = dp.FLASH.constrain();
     let mut rcc = dp.RCC.constrain();
+
     let mut gpioa = dp.GPIOA.split(&mut rcc.ahb);
+    let mut gpiof = dp.GPIOF.split(&mut rcc.ahb);
 
-    let freq = 1.mhz();
-    let clocks = rcc.cfgr.sysclk(64.mhz()).pclk1(32.mhz()).freeze(&mut flash.acr);
+    gpiof
+        .pf9
+        .into_open_drain_output(&mut gpiof.moder, &mut gpiof.otyper);
 
-    let mut _delay = Delay::new(cp.SYST, clocks);
+    let clocks = rcc
+        .cfgr
+        .sysclk(72.mhz())
+        .pclk1(3.mhz())
+        .freeze(&mut flash.acr);
+
+    let mut delay = Delay::new(cp.SYST, clocks);
+
+    // Set up SPI
 
     // Set up SPI
     let sck = gpioa.pa5.into_af5(&mut gpioa.moder, &mut gpioa.afrl);
@@ -37,47 +93,37 @@ fn main() -> ! {
     let mut spi = Spi::spi1(
         dp.SPI1,
         (sck, miso, mosi),
-        MODE_3,
-        1.khz(),
+        ws2812::MODE,
+        3.mhz(),
         clocks,
         &mut rcc.apb2,
     );
 
-    let mut gpiob = dp.GPIOB.split(&mut rcc.ahb);
-    let scl = gpiob.pb6.into_af4(&mut gpiob.moder, &mut gpiob.afrl);
-    let sda = gpiob.pb7.into_af4(&mut gpiob.moder, &mut gpiob.afrl);
 
-    let i2c = I2c::i2c1(dp.I2C1, (scl, sda), 400.khz(), clocks, &mut rcc.apb1);
-    let mut lsm303dlhc = Lsm303dlhc::new(i2c).unwrap();
 
-    let mut position = 0;
-    let mut old_accel = (0i16, 0i16, 0i16);
+    let mut data: [RGB8; 32] = [RGB8::default(); 32];
+    let mut i = 0u8;
 
     loop {
-        let accel = lsm303dlhc.accel().unwrap();
-        let delta = ((accel.x - old_accel.0).abs(), (accel.y - old_accel.1).abs(), (accel.z - old_accel.2).abs());
-        old_accel = (accel.x, accel.y, accel.z);
-        let max_accel = delta.0.abs().max(delta.1.abs()).max(delta.2.abs()) / 2048;
-        let first_byte = 0xE1 + (max_accel as u8);
-
-        // Write 32 0's to signal start of frame
-        spi.write(&[0, 0, 0, 0]).unwrap();
-
-        // For each LED, write 3 1's and 5 brightness bits, followed by
-        // a byte each of BGR.
-        for i in (0..NUM_LEDS).rev() {
-            match ((position + i) / 6) % 3 {
-                0 => spi.write(&[first_byte, 0x00, 0x00, 0xFF]).unwrap(),
-                1 => spi.write(&[first_byte, 0x00, 0xFF, 0x00]).unwrap(),
-                _ => spi.write(&[first_byte, 0xFF, 0x00, 0x00]).unwrap(),
-            }
+        for j in 0..32 {
+            let brightness = 0xFFu8 >> 16 - ((j + i) % 16);
+            data[j as usize] = wheel(i, brightness);
         }
 
-        // Follow up with at least N/2 1's.
-        spi.write(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
-        spi.write(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
-        spi.write(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
-            .unwrap();
-        position = (position + 1) % NUM_LEDS;
+        for item in data.iter() {
+            write_byte(&mut spi, item.g);
+            write_byte(&mut spi, item.r);
+            write_byte(&mut spi, item.b);
+            write_byte(&mut spi, 0);
+        }
+        for _ in 0..20 {
+            block!(spi.send(0)).unwrap();
+            spi.read().unwrap();
+        }
+
+        delay.delay_ms(50u16);
+
+        i += 1;
+        i %= 255;
     }
 }
