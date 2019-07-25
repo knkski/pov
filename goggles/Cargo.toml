@@ -2,7 +2,7 @@
 authors = ["Kenneth Koski <kennethkoski@gmail.com>"]
 edition = "2018"
 readme = "README.md"
-name = "pov"
+name = "goggles"
 version = "0.1.0"
 
 [dependencies]
