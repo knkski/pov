@@ -9,5 +9,5 @@ cargo build --release
 cargo objcopy -- -O binary target/thumbv6m-none-eabi/release/povdagger{,.bin}
 ./uf2conv.py -c -o target/thumbv6m-none-eabi/release/povdagger{.uf2,.bin}
 #sudo mount -o sync /dev/"$dev" /mnt
-sudo cp target/thumbv6m-none-eabi/release/povdagger.uf2 /media/ken/FEATHERBOOT/
+sudo cp target/thumbv6m-none-eabi/release/povdagger.uf2 /media/ken/F*BOOT/
 #sudo umount /mnt

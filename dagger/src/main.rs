@@ -9,6 +9,7 @@ extern crate panic_halt;
 use core::borrow::BorrowMut;
 use core::cell::Cell;
 use cortex_m::interrupt::{free, Mutex};
+use cortex_m::peripheral::NVIC;
 use hal::clock::GenericClockController;
 use hal::delay::Delay;
 use hal::entry;
@@ -27,14 +28,9 @@ type SPI4 = SPIMaster4<Sercom4Pad0<Pa12<PfD>>, Sercom4Pad2<Pb10<PfD>>, Sercom4Pa
 /// Flag that each function can check to see if it should stop
 static STOP: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 
-#[interrupt]
-fn SERCOM0() -> ! {
-    free(|cs| STOP.borrow(cs).set(true));
-}
-
 // First 3 bits are for the protocol, only last 5 bits determine
 // the 32 levels of brightness
-const BRIGHTNESS: u8 = 0b11111111;
+const BRIGHTNESS: u8 = 0b11100001;
 
 fn wheel(pos: u8) -> [u8; 3] {
     match pos {
@@ -44,7 +40,27 @@ fn wheel(pos: u8) -> [u8; 3] {
     }
 }
 
-fn light_show(spi: &mut SPI4, delay: &mut Delay) -> () {
+fn light_cycle(spi: &mut SPI4, delay: &mut Delay) -> () {
+    let mut i = 0;
+
+    loop {
+        spi.write(&[0, 0, 0, 0]).unwrap();
+        let color = wheel(i);
+        for _ in 0..144 {
+            spi.write(&[BRIGHTNESS, color[0], color[1], color[2]])
+                .unwrap();
+        }
+        i = (i + 1) % 255;
+
+        if free(|cs| STOP.borrow(cs).get()) {
+            return;
+        }
+
+        delay.delay_ms(16u16);
+    }
+}
+
+fn rave_mode(spi: &mut SPI4, delay: &mut Delay) -> () {
     let seed: [u8; 32] = [0; 32];
     let mut rng = ChaCha8Rng::from_seed(seed);
     let mut i = 0;
@@ -125,10 +141,21 @@ fn image_show(spi: &mut SPI4, _delay: &mut Delay) -> () {
     }
 }
 
+/* #[interrupt]
+ * fn EIC() {
+ *     cortex_m::asm::bkpt();
+ *
+ *     let eic: &mut mcu::EIC = unsafe { EIC.as_mut().expect("eic") };
+ *
+ *     if eic.intflag.read().extint2().bit_is_set() {
+ *         eic.intflag.modify(|_, w| w.extint2().set_bit());
+ *     }
+ * } */
+
 #[entry]
 fn main() -> ! {
     let mut peripherals = Peripherals::take().unwrap();
-    let core = CorePeripherals::take().unwrap();
+    let mut core = CorePeripherals::take().unwrap();
     let mut clocks = GenericClockController::with_external_32kosc(
         peripherals.GCLK,
         &mut peripherals.PM,
@@ -138,30 +165,92 @@ fn main() -> ! {
 
     let mut pins = hal::Pins::new(peripherals.PORT);
 
-    let mut spi = spi_master(
-        &mut clocks,
-        1500.khz(),
-        peripherals.SERCOM4,
-        peripherals.PM.borrow_mut(),
-        pins.sck,
-        pins.mosi,
-        pins.miso,
-        &mut pins.port,
-    );
+    /* let mut spi = spi_master(
+     *     &mut clocks,
+     *     1500.khz(),
+     *     peripherals.SERCOM4,
+     *     peripherals.PM.borrow_mut(),
+     *     pins.sck,
+     *     pins.mosi,
+     *     pins.miso,
+     *     &mut pins.port,
+     * ); */
 
     let mut delay = Delay::new(core.SYST, &mut clocks);
 
+    peripherals.PM.apbamask.modify(|_, w| w.eic_().set_bit());
+    peripherals.EIC.config[0].modify(|_, w| w.sense0().high());
+    peripherals.EIC.intenset.write(|w| w.extint0().set_bit());
+    peripherals.EIC.ctrl.modify(|_, w| w.enable().set_bit());
+    // let gclk = clocks.gclk1();
+    // use hal::pac::gclk::clkctrl::GEN_A;
+    // use hal::pac::gclk::genctrl::SRC_A;
+    // clocks.configure_gclk_divider_and_source(GEN_A::GCLK5, 1, SRC_A::XOSC, false);
+    // let gclk = clocks.get_gclk(GEN_A::GCLK5).unwrap();
+    // clocks.eic(&gclk);
+
+    let _external_interrupt: hal::gpio::Pb8<hal::gpio::PfA> = pins
+        .a1
+        .into_pull_down_input(&mut pins.port)
+        .into_function_a(&mut pins.port);
+
+    while peripherals.EIC.status.read().syncbusy().bit_is_set() {}
+    unsafe {
+        peripherals.NVMCTRL;
+        core.NVIC.set_priority(interrupt::EIC, 0x67);
+        core.NVIC.set_priority(interrupt::EIC, 0x68);
+        core.NVIC.set_priority(interrupt::EIC, 0x69);
+        NVIC::unmask(interrupt::EIC);
+    }
+
     let mut fn_idx = 0;
 
-    loop {
-        match fn_idx % 2 {
-            0 => light_show(&mut spi, &mut delay),
-            1 => image_show(&mut spi, &mut delay),
-            _ => unreachable!(),
-        }
+    let mut red_led = pins.d13.into_open_drain_output(&mut pins.port);
 
-        fn_idx += 1;
-        fn_idx %= 2;
-        free(|cs| STOP.borrow(cs).set(false));
+    if NVIC::is_enabled(interrupt::EIC) {
+      red_led.set_high().unwrap();
+      delay.delay_ms(1000u16);
+      red_led.set_low().unwrap();
+      delay.delay_ms(1000u16);
     }
+
+    loop {
+        if free(|cs| STOP.borrow(cs).get()) {
+            red_led.set_high().unwrap();
+            delay.delay_ms(1000u16);
+            red_led.set_low().unwrap();
+            if peripherals.EIC.intflag.read().extint2().bit_is_set() {
+                peripherals
+                    .EIC
+                    .intflag
+                    .modify(|_, w| w.extint2().clear_bit());
+            }
+        }
+        // match fn_idx % 3 {
+        // 0 => light_cycle(&mut spi, &mut delay),
+        // 1 => rave_mode(&mut spi, &mut delay),
+        // 2 => image_show(&mut spi, &mut delay),
+        // _ => unreachable!(),
+        // }
+        //
+        // fn_idx += 1;
+        // fn_idx %= 3;
+        //
+        //
+        // if peripherals.EIC.intflag.read().extint2().bit_is_set() {
+        // peripherals.EIC.intflag.modify(|_, w| w.extint2().set_bit());
+        // }
+        //
+        // red_led.set_high().unwrap();
+        // delay.delay_ms(200u8);
+        // red_led.set_low().unwrap();
+        //
+        // free(|cs| STOP.borrow(cs).set(false));
+    }
+}
+
+#[interrupt]
+fn EIC() {
+    // cortex_m::asm::bkpt();
+    free(|cs| STOP.borrow(cs).set(true));
 }

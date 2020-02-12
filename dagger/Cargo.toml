@@ -8,8 +8,9 @@ version = "0.1.0"
 [dependencies]
 apa102-spi = "0.3"
 cortex-m = "0.6"
-embedded-hal = "0.2"
-feather_m0 = "0.5"
+embedded-hal = { version = "0.2", features = ["unproven"] }
+# feather_m0 = "0.5"
+feather_m0 = { path = "../../../Sources/atsamd/boards/feather_m0", features = ["unproven"] }
 panic-halt = "0.2"
 rand = { version = "0.7", default-features = false }
 rand_chacha = { version = "0.2", default-features = false }
