@@ -2,12 +2,9 @@
 
 set -euxo pipefail
 
-#dev=$1
-#example=$2
+ARCH="thumbv7em-none-eabihf"
 
 cargo build --release
-cargo objcopy -- -O binary target/thumbv6m-none-eabi/release/povdagger{,.bin}
-./uf2conv.py -c -o target/thumbv6m-none-eabi/release/povdagger{.uf2,.bin}
-#sudo mount -o sync /dev/"$dev" /mnt
-sudo cp target/thumbv6m-none-eabi/release/povdagger.uf2 /media/ken/F*BOOT/
-#sudo umount /mnt
+cargo objcopy -- -O binary target/$ARCH/release/povdagger{,.bin}
+./uf2conv.py -c -f SAMD51 -b 0x4000 -o target/$ARCH/release/povdagger{.uf2,.bin}
+sudo cp target/$ARCH/release/povdagger.uf2 /media/ken/FEATHERBOOT/CURRENT.UF2

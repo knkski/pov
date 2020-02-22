@@ -6,15 +6,16 @@ name = "povdagger"
 version = "0.1.0"
 
 [dependencies]
-apa102-spi = "0.3"
 cortex-m = "0.6"
+cortex-m-rt = "0.6"
 embedded-hal = { version = "0.2", features = ["unproven"] }
-# feather_m0 = "0.5"
-feather_m0 = { path = "../../../Sources/atsamd/boards/feather_m0", features = ["unproven"] }
+feather_m4 = { git = "https://github.com/atsamd-rs/atsamd/", features = ["unproven"] }
 panic-halt = "0.2"
-rand = { version = "0.7", default-features = false }
-rand_chacha = { version = "0.2", default-features = false }
+panic-semihosting = "0.5"
+cortex-m-semihosting = "0.3"
 tinybmp = "0.1"
+bno055 = "0.3"
+mint = "0.5"
 
 [[bin]]
 name = "povdagger"
