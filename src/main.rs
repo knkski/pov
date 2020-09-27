@@ -11,21 +11,29 @@ use crate::timer::Timer;
 use bno055::Bno055;
 use cortex_m::peripheral::ITM;
 use embedded_hal::blocking::spi::Write;
-use hal::{clocks, gpio::Level, prelude::*};
+use hal::{
+    clocks,
+    gpio::{Floating, Input, Level, Pin},
+    prelude::*,
+    saadc,
+};
+use heapless::{consts::U64, Vec};
 use nrf52840_hal as hal;
 use nrf52840_pac as pac;
 use rtfm::app;
 
 // Will be used
-/* fn wheel(pos: u8) -> [u8; 4] {
- *     match pos {
- *         0..=84 => [255, 255 - 3 * pos, 3 * pos, 0],
- *         85..=169 => [255, 0, 255 - 3 * (pos - 85), 3 * (pos - 85)],
- *         170..=255 => [255, 3 * (pos - 170), 0, 255 - 3 * (pos - 170)],
- *     }
- * } */
+fn wheel(pos: u8) -> [u8; 3] {
+     match pos {
+         0..=84 => [255 - 3 * pos, 3 * pos, 0],
+         85..=169 => [0, 255 - 3 * (pos - 85), 3 * (pos - 85)],
+         170..=255 => [3 * (pos - 170), 0, 255 - 3 * (pos - 170)],
+     }
+}
+
 
 const NUM_DOTS: u32 = 72;
+const MAX_PRESSURE: i16 = 12800;
 
 #[app(device = nrf52840_pac, peripherals = true)]
 const APP: () = {
@@ -40,7 +48,10 @@ const APP: () = {
         spi: hal::spim::Spim<pac::SPIM0>,
         bno055: Bno055<hal::twim::Twim<hal::pac::TWIM1>>,
         counter: u8,
-        color: (u8, u8, u8, u8),
+        accel_samples: Vec<f32, U64>,
+        analog: hal::Saadc,
+        analog_pin: hal::gpio::p0::P0_04<hal::gpio::Input<hal::gpio::Floating>>,
+        intensity: u8,
     }
 
     #[init]
@@ -59,7 +70,7 @@ const APP: () = {
         // Set up timers
         let mut timer1 = cx.device.TIMER1;
         timer1.init();
-        timer1.fire_at(1, 100_000);
+        timer1.fire_at(1, 16_000);
 
         let mut timer2 = cx.device.TIMER2;
         timer2.init();
@@ -75,7 +86,7 @@ const APP: () = {
         led.set_high().unwrap();
 
         // Set up SPI for dot star light strip
-        let port0 = hal::gpio::p0::Parts::new(cx.device.P0);
+        let mut port0 = hal::gpio::p0::Parts::new(cx.device.P0);
         let spiclk = port0.p0_14.into_push_pull_output(Level::Low).degrade();
         let spimosi = port0.p0_13.into_push_pull_output(Level::Low).degrade();
         let pins = hal::spim::Pins {
@@ -90,6 +101,9 @@ const APP: () = {
             hal::spim::MODE_0,
             0,
         );
+        let mut analog = saadc::Saadc::new(cx.device.SAADC, saadc::SaadcConfig::default());
+        let mut analog_pin = port0.p0_04;
+        log::info!("PIN: {}", analog.read(&mut analog_pin).unwrap());
 
         let itm = &mut cx.core.ITM.stim[0];
 
@@ -123,42 +137,74 @@ const APP: () = {
             spi,
             bno055,
             counter: 0,
-            color: (0xFF, 0x0, 0x0, 0x7F),
+            accel_samples: Vec::new(),
+            analog,
+            analog_pin,
+            intensity: 255,
         }
     }
 
-    #[task(binds = TIMER1, resources = [timer1, bno055, color])]
+    #[task(binds = TIMER1, resources = [timer1, bno055, accel_samples, analog, analog_pin, intensity])]
     fn timer1(cx: timer1::Context) {
         let timer = cx.resources.timer1;
+        let analog = cx.resources.analog;
+        let analog_pin = cx.resources.analog_pin;
+        let pressure = analog.read(&mut *analog_pin);
 
         timer.ack_compare_event(1);
+        if let Ok(p) = pressure {
+            let clamped = p.max(0).min(MAX_PRESSURE) as u32;
+            *cx.resources.intensity = (clamped * 31 / (MAX_PRESSURE as u32)) as u8;
+            log::info!("INTENSITY: {}", *cx.resources.intensity);
+        }
 
-        let quat: mint::Quaternion<f32> = cx.resources.bno055.quaternion().unwrap();
-        *cx.resources.color = (
-            (quat.v.x * 255.) as u8,
-            (quat.v.y * 255.) as u8,
-            (quat.v.z * 255.) as u8,
-            0x7F,
-        );
-        let _ = timer.fire_at(1, 100_000);
+        /* match cx.resources.bno055.quaternion() {
+         *     Ok(q) => {
+         *         *cx.resources.color = (
+         *             (q.v.x * 127. + 128.) as u8,
+         *             (q.v.y * 127. + 128.) as u8,
+         *             (q.v.z * 127. + 128.) as u8,
+         *             0x7F,
+         *         );
+         *     }
+         *     Err(err) => {
+         *         log::error!("{:?}", err);
+         *     }
+         * }; */
+
+        match cx.resources.bno055.linear_acceleration() {
+            Ok(a) => {
+                if a.x > 5. {
+                    log::info!("a.x: {}", a.x);
+                }
+            }
+            Err(err) => log::error!("ACCEL ERROR: {:?}", err),
+        }
+
+        // if cx.resources.accel_samples.len() >= 64 {
+        // log::info!("SAMPLES: {:?}", cx.resources.accel_samples);
+        // cx.resources.accel_samples.clear();
+        // }
+
+        // let temp = cx.resources.bno055.temperature().unwrap();
+        let _ = timer.fire_at(1, 16_000);
     }
 
-    #[task(binds = TIMER2, resources = [timer2, spi, counter, color])]
+    #[task(binds = TIMER2, resources = [timer2, spi, counter, analog, intensity])]
     fn timer2(cx: timer2::Context) {
         let timer = cx.resources.timer2;
 
         timer.ack_compare_event(1);
         Write::write(&mut *cx.resources.spi, &[0, 0, 0, 0]).unwrap();
-        // let color = wheel(*cx.resources.counter);
+        let color = wheel(*cx.resources.counter);
         for _ in 0..NUM_DOTS {
-            // Write::write(&mut *cx.resources.spi, &color).unwrap();
             Write::write(
                 &mut *cx.resources.spi,
                 &[
-                    cx.resources.color.0,
-                    cx.resources.color.1,
-                    cx.resources.color.2,
-                    cx.resources.color.3,
+                    0xE0 + *cx.resources.intensity,
+                    color[0],
+                    color[1],
+                    color[2],
                 ],
             )
             .unwrap();

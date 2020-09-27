@@ -12,10 +12,13 @@ edition = "2018"
 [dependencies]
 bbqueue = "0.4"
 bno055 = { git = "https://github.com/eupn/bno055.git" }
+# bno055 = { path = "/home/ken/Sources/bno055" }
 cortex-m = "0.6"
 cortex-m-rt = "0.6"
 cortex-m-rtfm = "0.5"
 embedded-hal = "0.2"
+heapless = "0.5"
+libm = "0.2"
 log = "0.4"
 mint = "0.5"
 nrf52840-hal = "0.10"
