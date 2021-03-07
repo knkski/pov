@@ -14,7 +14,7 @@ use embedded_hal::blocking::spi::Write;
 use hal::{clocks, gpio::{Level}, prelude::*, saadc, gpiote::{Gpiote, TaskOutPolarity}, ppi};
 use nrf52840_hal as hal;
 use nrf52840_pac as pac;
-use rtfm::app;
+use rtic::app;
 
 // Will be used
 fn wheel(pos: u8) -> [u8; 3] {
