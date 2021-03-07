@@ -11,12 +11,15 @@ use crate::timer::Timer;
 use bno055::Bno055;
 use cortex_m::peripheral::ITM;
 use embedded_hal::blocking::spi::Write;
-use hal::{clocks, gpio::{Level}, prelude::*, saadc, gpiote::{Gpiote, TaskOutPolarity}, ppi};
+use hal::clocks::{Clocks, LfOscConfiguration};
+use hal::delay::Delay;
+use hal::gpio::{p0, p1, Input, Level, Pin, PullUp};
+use hal::gpiote::{Gpiote, TaskOutPolarity};
+use hal::{ppi, prelude::*, spim, twim};
 use nrf52840_hal as hal;
 use nrf52840_pac as pac;
 use rtic::app;
 
-// Will be used
 fn wheel(pos: u8) -> [u8; 3] {
     match pos {
         0..=84 => [255 - 3 * pos, 3 * pos, 0],
@@ -102,20 +105,16 @@ const APP: () = {
         mode: Mode,
 
         gpiote: Gpiote,
-        btn1: hal::gpio::Pin<hal::gpio::Input<hal::gpio::PullUp>>,
+        btn1: Pin<Input<PullUp>>,
 
         /// The number of cycles currently elapsed since last mode switch,
         /// where a cycle is a single tick of TIMER2
         mode_switch_cycles: Option<u8>,
-        spi: hal::spim::Spim<pac::SPIM0>,
-        bno055: Bno055<hal::twim::Twim<hal::pac::TWIM1>>,
+        spi: spim::Spim<pac::SPIM0>,
+        bno055: Bno055<twim::Twim<pac::TWIM1>>,
         counter: u8,
         accel_samples: [f32; 64],
         accel_head: usize,
-        analog: hal::Saadc,
-        pressure: hal::gpio::p0::P0_04<hal::gpio::Disconnected>,
-        pressure_level: u16,
-        is_analog_pressed: bool,
         temp: i8,
         orientation: [u8; 3],
     }
@@ -127,9 +126,9 @@ const APP: () = {
         let log_consumer = logger::init(timer0);
 
         // Configure to use external clocks, and start them
-        let _clocks = hal::clocks::Clocks::new(cx.device.CLOCK)
+        Clocks::new(cx.device.CLOCK)
             .enable_ext_hfosc()
-            .set_lfclk_src_external(clocks::LfOscConfiguration::NoExternalNoBypass)
+            .set_lfclk_src_external(LfOscConfiguration::NoExternalNoBypass)
             .start_lfclk();
 
         // Set up timers
@@ -146,23 +145,18 @@ const APP: () = {
         timer3.fire_at(1, TIMER3_FREQ);
 
         // Set up SPI for dot star light strip
-        let port0 = hal::gpio::p0::Parts::new(cx.device.P0);
+        let port0 = p0::Parts::new(cx.device.P0);
         let spiclk = port0.p0_14.into_push_pull_output(Level::Low).degrade();
         let spimosi = port0.p0_13.into_push_pull_output(Level::Low).degrade();
-        let pins = hal::spim::Pins {
+        let pins = spim::Pins {
             sck: spiclk,
             miso: None,
             mosi: Some(spimosi),
         };
-        let spi = hal::spim::Spim::new(
-            cx.device.SPIM0,
-            pins,
-            hal::spim::Frequency::M1,
-            hal::spim::MODE_0,
-            0,
-        );
+        let spi = spim::Spim::new(cx.device.SPIM0, pins, spim::Frequency::M1, spim::MODE_0, 0);
 
-        let port1 = hal::gpio::p1::Parts::new(cx.device.P1);
+        // Set up on-board button to toggle on-board LED
+        let port1 = p1::Parts::new(cx.device.P1);
         let btn1 = port1.p1_02.into_pullup_input().degrade();
         let led1 = port1.p1_15.into_push_pull_output(Level::High).degrade();
         let gpiote = Gpiote::new(cx.device.GPIOTE);
@@ -194,16 +188,16 @@ const APP: () = {
         // Set up bno055
         let scl = port0.p0_11.into_floating_input().degrade();
         let sda = port0.p0_12.into_floating_input().degrade();
-        let pins = hal::twim::Pins { scl, sda };
-        let i2c = hal::twim::Twim::new(cx.device.TWIM1, pins, hal::twim::Frequency::K100);
+        let pins = twim::Pins { scl, sda };
+        let i2c = twim::Twim::new(cx.device.TWIM1, pins, twim::Frequency::K100);
         let mut bno055 = bno055::Bno055::new(i2c).with_alternative_address();
-        let mut delay = hal::delay::Delay::new(cx.core.SYST);
+        let mut delay = Delay::new(cx.core.SYST);
         bno055.init(&mut delay).unwrap();
         bno055
             .set_mode(bno055::BNO055OperationMode::ACC_GYRO, &mut delay)
             .unwrap();
 
-        // We're all set up, hand off control back to RTFM
+        // We're all set up, hand off control back to RTIC
         init::LateResources {
             timer1,
             timer2,
@@ -219,10 +213,6 @@ const APP: () = {
             counter: 0,
             accel_samples: [0.; 64],
             accel_head: 9,
-            analog: saadc::Saadc::new(cx.device.SAADC, saadc::SaadcConfig::default()),
-            pressure: port0.p0_04,
-            pressure_level: 0,
-            is_analog_pressed: false,
             temp: 0,
             orientation: [0, 0, 0],
         }
@@ -233,10 +223,6 @@ const APP: () = {
         bno055,
         accel_samples,
         accel_head,
-        analog,
-        pressure,
-        pressure_level,
-        is_analog_pressed,
         mode,
         mode_switch_cycles,
         temp,
@@ -244,17 +230,11 @@ const APP: () = {
     ])]
     fn timer1(cx: timer1::Context) {
         let timer = cx.resources.timer1;
-        let analog = cx.resources.analog;
-        let pressure = cx.resources.pressure;
         let bno055 = cx.resources.bno055;
         let accel_samples = cx.resources.accel_samples;
         let accel_head = cx.resources.accel_head;
 
         timer.ack_compare_event(1);
-
-        if let Ok(p) = analog.read(&mut *pressure) {
-            *cx.resources.pressure_level = p.max(0) as u16;
-        }
 
         *cx.resources.temp = bno055.temperature().unwrap();
 
@@ -283,7 +263,16 @@ const APP: () = {
         let _ = timer.fire_at(1, TIMER1_FREQ);
     }
 
-    #[task(binds = TIMER2, resources = [timer2, spi, counter, analog, pressure_level, orientation, mode, mode_switch_cycles, accel_samples, accel_head])]
+    #[task(binds = TIMER2, resources = [
+        timer2,
+        spi,
+        counter,
+        orientation,
+        mode,
+        mode_switch_cycles,
+        accel_samples,
+        accel_head
+    ])]
     fn timer2(cx: timer2::Context) {
         let timer = cx.resources.timer2;
         timer.ack_compare_event(1);
