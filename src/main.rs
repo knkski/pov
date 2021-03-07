@@ -11,8 +11,7 @@ use crate::timer::Timer;
 use bno055::Bno055;
 use cortex_m::peripheral::ITM;
 use embedded_hal::blocking::spi::Write;
-use hal::{clocks, gpio::Level, prelude::*, saadc};
-use heapless::{consts::U64, Vec};
+use hal::{clocks, gpio::{Level}, prelude::*, saadc, gpiote::{Gpiote, TaskOutPolarity}, ppi};
 use nrf52840_hal as hal;
 use nrf52840_pac as pac;
 use rtfm::app;
@@ -27,28 +26,44 @@ fn wheel(pos: u8) -> [u8; 3] {
 }
 
 const NUM_DOTS: u32 = 144;
-const MAX_PRESSURE: i16 = 12800;
 const TIMER1_FREQ: u32 = 16_000;
 const TIMER2_FREQ: u32 = 16_000;
 const TIMER3_FREQ: u32 = 16_000;
 
-fn mode_rgb_all(spi: &mut hal::Spim<pac::SPIM0>, counter: &mut u8, intensity: &mut u8) {
+fn mode_rgb_all(spi: &mut hal::Spim<pac::SPIM0>, counter: &mut u8) {
     Write::write(&mut *spi, &[0, 0, 0, 0]).unwrap();
     let color = wheel(*counter);
     for _ in 0..NUM_DOTS {
-        // Write::write(&mut *spi, &[0xFF, color[0], color[1], color[2]]).unwrap();
-        Write::write(&mut *spi, &[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        Write::write(&mut *spi, &[0xFF, color[0], color[1], color[2]]).unwrap();
     }
-    *counter = counter.wrapping_add(*intensity.max(&mut 1));
+    *counter = counter.wrapping_add(1);
 }
 
-fn mode_rgb_per(spi: &mut hal::Spim<pac::SPIM0>, counter: &mut u8, intensity: &mut u8) {
+fn mode_rgb_per(spi: &mut hal::Spim<pac::SPIM0>, counter: &mut u8) {
     Write::write(&mut *spi, &[0, 0, 0, 0]).unwrap();
     for i in 0..NUM_DOTS {
         let color = wheel(i as u8 + *counter);
         Write::write(&mut *spi, &[0xFF, color[0], color[1], color[2]]).unwrap();
     }
-    *counter = counter.wrapping_add(*intensity.max(&mut 1));
+    *counter = counter.wrapping_add(1);
+}
+
+fn mode_orientation(spi: &mut hal::Spim<pac::SPIM0>, orientation: &mut [u8; 3]) {
+    Write::write(&mut *spi, &[0, 0, 0, 0]).unwrap();
+    for _ in 0..NUM_DOTS {
+        Write::write(
+            &mut *spi,
+            &[0xFF, orientation[0], orientation[1], orientation[2]],
+        )
+        .unwrap();
+    }
+}
+
+fn mode_acceleration(spi: &mut hal::Spim<pac::SPIM0>, accel_samples: &[f32], accel_head: &usize) {
+    Write::write(&mut *spi, &[0, 0, 0, 0]).unwrap();
+    for _ in 0..NUM_DOTS {
+        Write::write(&mut *spi, &[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+    }
 }
 
 fn mode_switch(spi: &mut hal::Spim<pac::SPIM0>) {
@@ -59,6 +74,8 @@ fn mode_switch(spi: &mut hal::Spim<pac::SPIM0>) {
 }
 
 pub enum Mode {
+    Orientation,
+    Acceleration,
     RGBAll,
     RGBPer,
 }
@@ -66,8 +83,10 @@ pub enum Mode {
 impl Mode {
     pub fn next(&mut self) {
         *self = match self {
+            Mode::Orientation => Mode::Acceleration,
+            Mode::Acceleration => Mode::RGBAll,
             Mode::RGBAll => Mode::RGBPer,
-            Mode::RGBPer => Mode::RGBAll,
+            Mode::RGBPer => Mode::Orientation,
         }
     }
 }
@@ -82,20 +101,23 @@ const APP: () = {
         log_consumer: bbqueue::Consumer<'static, logger::LogBufferSize>,
         mode: Mode,
 
+        gpiote: Gpiote,
+        btn1: hal::gpio::Pin<hal::gpio::Input<hal::gpio::PullUp>>,
+
         /// The number of cycles currently elapsed since last mode switch,
         /// where a cycle is a single tick of TIMER2
         mode_switch_cycles: Option<u8>,
         spi: hal::spim::Spim<pac::SPIM0>,
         bno055: Bno055<hal::twim::Twim<hal::pac::TWIM1>>,
         counter: u8,
-        accel_samples: Vec<f32, U64>,
+        accel_samples: [f32; 64],
+        accel_head: usize,
         analog: hal::Saadc,
-        pressure: hal::gpio::p0::P0_04<hal::gpio::Input<hal::gpio::Floating>>,
-        pressure_level: u8,
-        capacitive: hal::gpio::p0::P0_05<hal::gpio::Input<hal::gpio::Floating>>,
-        capacitive_level: u8,
+        pressure: hal::gpio::p0::P0_04<hal::gpio::Disconnected>,
+        pressure_level: u16,
         is_analog_pressed: bool,
         temp: i8,
+        orientation: [u8; 3],
     }
 
     #[init]
@@ -140,6 +162,35 @@ const APP: () = {
             0,
         );
 
+        let port1 = hal::gpio::p1::Parts::new(cx.device.P1);
+        let btn1 = port1.p1_02.into_pullup_input().degrade();
+        let led1 = port1.p1_15.into_push_pull_output(Level::High).degrade();
+        let gpiote = Gpiote::new(cx.device.GPIOTE);
+        gpiote
+            .channel0()
+            .input_pin(&btn1)
+            .hi_to_lo()
+            .enable_interrupt();
+        gpiote
+            .channel1()
+            .input_pin(&btn1)
+            .lo_to_hi()
+            .enable_interrupt();
+        gpiote
+            .channel2()
+            .output_pin(led1)
+            .task_out_polarity(TaskOutPolarity::Toggle)
+            .init_low();
+        let ppi_channels = ppi::Parts::new(cx.device.PPI);
+        let mut ppi0 = ppi_channels.ppi0;
+        ppi0.set_task_endpoint(gpiote.channel2().task_out());
+        ppi0.set_event_endpoint(gpiote.channel0().event());
+        ppi0.enable();
+        let mut ppi1 = ppi_channels.ppi1;
+        ppi1.set_task_endpoint(gpiote.channel2().task_out());
+        ppi1.set_event_endpoint(gpiote.channel1().event());
+        ppi1.enable();
+
         // Set up bno055
         let scl = port0.p0_11.into_floating_input().degrade();
         let sda = port0.p0_12.into_floating_input().degrade();
@@ -149,7 +200,7 @@ const APP: () = {
         let mut delay = hal::delay::Delay::new(cx.core.SYST);
         bno055.init(&mut delay).unwrap();
         bno055
-            .set_mode(bno055::BNO055OperationMode::NDOF, &mut delay)
+            .set_mode(bno055::BNO055OperationMode::ACC_GYRO, &mut delay)
             .unwrap();
 
         // We're all set up, hand off control back to RTFM
@@ -159,19 +210,21 @@ const APP: () = {
             timer3,
             itm: cx.core.ITM,
             log_consumer,
-            mode: Mode::RGBAll,
+            mode: Mode::Acceleration,
+            gpiote,
+            btn1,
             mode_switch_cycles: None,
             spi,
             bno055,
             counter: 0,
-            accel_samples: Vec::new(),
+            accel_samples: [0.; 64],
+            accel_head: 9,
             analog: saadc::Saadc::new(cx.device.SAADC, saadc::SaadcConfig::default()),
             pressure: port0.p0_04,
             pressure_level: 0,
-            capacitive: port0.p0_05,
-            capacitive_level: 0,
             is_analog_pressed: false,
             temp: 0,
+            orientation: [0, 0, 0],
         }
     }
 
@@ -179,53 +232,58 @@ const APP: () = {
         timer1,
         bno055,
         accel_samples,
+        accel_head,
         analog,
         pressure,
         pressure_level,
-        capacitive,
-        capacitive_level,
         is_analog_pressed,
         mode,
-        mode_switch_cycles
+        mode_switch_cycles,
+        temp,
+        orientation,
     ])]
     fn timer1(cx: timer1::Context) {
         let timer = cx.resources.timer1;
         let analog = cx.resources.analog;
         let pressure = cx.resources.pressure;
-        let cycles = cx.resources.mode_switch_cycles;
+        let bno055 = cx.resources.bno055;
+        let accel_samples = cx.resources.accel_samples;
+        let accel_head = cx.resources.accel_head;
 
         timer.ack_compare_event(1);
 
-        if let Ok(c) = analog.read(&mut *cx.resources.capacitive) {
-            *cx.resources.capacitive_level = c.max(0).min(255) as u8;
-        }
-
         if let Ok(p) = analog.read(&mut *pressure) {
-            let clamped = p.max(0).min(MAX_PRESSURE) as u32;
-            *cx.resources.pressure_level = (clamped * 31 / (MAX_PRESSURE as u32)) as u8;
+            *cx.resources.pressure_level = p.max(0) as u16;
         }
 
-        match (
-            cx.resources.capacitive_level,
-            cx.resources.is_analog_pressed,
-        ) {
-            (0...100, ap) => {
-                *ap = false;
+        *cx.resources.temp = bno055.temperature().unwrap();
+
+        match bno055.accel_data() {
+            Ok(a) => {
+                accel_samples[*accel_head] = a.x.max(a.y);
+                *accel_head += 1;
+                *accel_head %= accel_samples.len();
+                if *accel_head == 0 {
+                    log::info!("{}, {:?}", accel_head, accel_samples);
+                }
             }
-            (_, ap @ false) => {
-                *ap = true;
-                *cycles = Some(0);
-                cx.resources.mode.next();
+            Err(err) => {
+                log::error!("{:?}", err);
             }
-            (_, ap @ true) => {
-                *ap = true;
-            }
+        }
+
+        if let Ok(q) = bno055.quaternion() {
+            *cx.resources.orientation = [
+                (255. * q.v.x) as u8,
+                (255. * q.v.y) as u8,
+                (255. * q.v.z) as u8,
+            ];
         }
 
         let _ = timer.fire_at(1, TIMER1_FREQ);
     }
 
-    #[task(binds = TIMER2, resources = [timer2, spi, counter, analog, pressure_level, mode, mode_switch_cycles])]
+    #[task(binds = TIMER2, resources = [timer2, spi, counter, analog, pressure_level, orientation, mode, mode_switch_cycles, accel_samples, accel_head])]
     fn timer2(cx: timer2::Context) {
         let timer = cx.resources.timer2;
         timer.ack_compare_event(1);
@@ -234,15 +292,15 @@ const APP: () = {
         let cycles = cx.resources.mode_switch_cycles;
 
         match (cycles, mode) {
-            (None, Mode::RGBAll) => mode_rgb_all(
+            (None, Mode::RGBAll) => mode_rgb_all(cx.resources.spi, cx.resources.counter),
+            (None, Mode::RGBPer) => mode_rgb_per(cx.resources.spi, cx.resources.counter),
+            (None, Mode::Orientation) => {
+                mode_orientation(cx.resources.spi, cx.resources.orientation)
+            }
+            (None, Mode::Acceleration) => mode_acceleration(
                 cx.resources.spi,
-                cx.resources.counter,
-                cx.resources.pressure_level,
-            ),
-            (None, Mode::RGBPer) => mode_rgb_per(
-                cx.resources.spi,
-                cx.resources.counter,
-                cx.resources.pressure_level,
+                cx.resources.accel_samples,
+                cx.resources.accel_head,
             ),
             (Some(c @ 0...32), _) => {
                 mode_switch(cx.resources.spi);
@@ -256,15 +314,25 @@ const APP: () = {
         let _ = timer.fire_at(1, TIMER2_FREQ);
     }
 
-    #[task(binds = TIMER3, resources = [timer3, bno055, temp])]
+    #[task(binds = TIMER3, resources = [timer3])]
     fn timer3(cx: timer3::Context) {
         let timer = cx.resources.timer3;
 
         timer.ack_compare_event(1);
 
-        *cx.resources.temp = cx.resources.bno055.temperature().unwrap();
-
         let _ = timer.fire_at(1, TIMER3_FREQ);
+    }
+
+    #[task(binds = GPIOTE, resources = [gpiote])]
+    fn on_gpiote(ctx: on_gpiote::Context) {
+        if ctx.resources.gpiote.channel0().is_event_triggered() {
+            log::info!("Interrupt from channel 0 event");
+            ctx.resources.gpiote.channel0().reset_events();
+        }
+        if ctx.resources.gpiote.channel1().is_event_triggered() {
+            log::info!("Interrupt from channel 1 event");
+            ctx.resources.gpiote.channel1().reset_events();
+        }
     }
 
     #[idle(resources = [itm, log_consumer])]
