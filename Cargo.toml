@@ -16,7 +16,9 @@ cortex-m = "0.7"
 cortex-m-rt = "0.6"
 cortex-m-rtic = "0.5"
 embedded-hal = "0.2"
+glam = { version = "0.15", default-features = false, features = ["libm", "mint"] }
 log = "0.4"
 nrf52840-hal = "0.12"
 nrf52840-pac = "0.9"
 panic-itm = "0.4"
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
