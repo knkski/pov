@@ -2,7 +2,6 @@
 #![no_std]
 
 mod encoder;
-mod timer;
 
 use core::panic::PanicInfo;
 use num_traits::float::Float;
@@ -115,7 +114,6 @@ mod app {
         mode_crackle, mode_liquid, mode_math, mode_rgb_per, mode_rgb_per_slow, Mode, NUM_DOTS,
     };
     use crate::encoder::Encoder;
-    use crate::timer::Timer;
     use embedded_hal::blocking::spi::Write;
     use hal::clocks::{Clocks, LfOscConfiguration};
     use hal::delay::Delay;
@@ -161,9 +159,20 @@ mod app {
 
         let interval = 16_000;
 
-        let mut timer1 = ctx.device.TIMER1;
-        timer1.init();
-        timer1.fire_at(1, interval);
+        let timer1 = ctx.device.TIMER1;
+        timer1.mode.write(|w| w.mode().timer());
+        timer1.bitmode.write(|w| w.bitmode()._32bit());
+        timer1.prescaler.write(|w| unsafe { w.prescaler().bits(4) });
+        timer1.tasks_clear.write(|w| w.tasks_clear().set_bit());
+        timer1.tasks_start.write(|w| w.tasks_start().set_bit());
+
+        timer1.tasks_capture[0].write(|w| w.tasks_capture().set_bit());
+        let now = timer1.cc[0].read().bits();
+
+        let later = now.wrapping_add(interval);
+        timer1.cc[1].write(|w| unsafe { w.bits(later) });
+        timer1.events_compare[1].reset();
+        timer1.intenset.write(|w| w.compare1().set());
 
         // Set up GPIO ports
         let port1 = p1::Parts::new(ctx.device.P1);
@@ -233,7 +242,7 @@ mod app {
         let t = ctx.local.t;
         let mode = ctx.shared.mode.lock(|m| *m);
 
-        timer.ack_compare_event(1);
+        timer.events_compare[1].reset();
 
         Write::write(ctx.local.spim, &[0, 0, 0, 0]).unwrap();
         for i in 0..NUM_DOTS {
@@ -259,7 +268,12 @@ mod app {
 
         *t = t.wrapping_add(1);
 
-        let _ = timer.fire_at(1, *interval);
+        timer.tasks_capture[0].write(|w| w.tasks_capture().set_bit());
+        let now = timer.cc[0].read().bits();
+        let later = now.wrapping_add(*interval);
+        timer.cc[1].write(|w| unsafe { w.bits(later) });
+        timer.events_compare[1].reset();
+        timer.intenset.write(|w| w.compare1().set());
     }
 
     #[task(
